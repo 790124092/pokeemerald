@@ -1,0 +1,8 @@
+Starting training...
+[2026-02-24 23:37:54.821470] Args: Namespace(rom='pokeemerald.gba', frame_skip=10, image_size=[84, 84], num_envs=12, algorithm='ppo', total_steps=1000000, update_freq=1000, save_freq=10000, log_freq=100, eval_freq=5000, reward_config='start_game', custom_reward=None, lr=0.0003, gamma=0.99, eps_clip=0.2, seed=42, save_dir='checkpoints', resume=None, device='mps', render=True)
+[2026-02-24 23:37:55.842386] Render arg: True
+[2026-02-24 23:37:56.174845] Pygame initialized
+[2026-02-24 23:37:56.565754] Screen created: <Surface(480x320x32 SW)>
+[2026-02-24 23:37:56.657093] Env reset done
+[2026-02-24 23:37:56.657187] Initial render done
+[2026-02-24 23:37:56.843396] Resized screen to 1920x960

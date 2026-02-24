@@ -15,7 +15,7 @@ from gym import spaces
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from environment.emulator import Emulator
+from agent.environment.emulator import Emulator
 
 
 class PokemonEnv(gym.Env):
@@ -133,6 +133,10 @@ class PokemonEnv(gym.Env):
         self.prev_state = self.emulator.get_state(include_screenshot=True)
         self.current_state = self.prev_state
 
+        # 重置奖励函数状态
+        if self.reward_fn:
+            self.reward_fn.reset()
+
         return self._get_observation()
 
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict]:
@@ -176,6 +180,7 @@ class PokemonEnv(gym.Env):
             'location': self.current_state.get('location', {}),
             'party': self.current_state.get('party', []),
             'bag': self.current_state.get('bag', {}),
+            'screenshot': self.current_state.get('screenshot'),
         }
 
         return self._get_observation(), reward, done, info
@@ -297,6 +302,17 @@ class PokemonEnv(gym.Env):
     def set_reward_function(self, reward_fn):
         """设置奖励函数"""
         self.reward_fn = reward_fn
+
+    def get_reward_state(self) -> Dict:
+        """获取奖励函数状态"""
+        if self.reward_fn:
+            return self.reward_fn.state_dict()
+        return {}
+
+    def set_reward_state(self, state_dict: Dict):
+        """设置奖励函数状态"""
+        if self.reward_fn:
+            self.reward_fn.load_state_dict(state_dict)
 
     def get_state_dict(self) -> Dict:
         """获取完整的状态字典"""

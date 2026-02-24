@@ -24,12 +24,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 @dataclass
 class RolloutBuffer:
     """存储 rollout 数据"""
-    observations: List[np.ndarray]
-    actions: List[int]
-    rewards: List[float]
-    dones: List[bool]
-    log_probs: List[float]
-    values: List[float]
+    observations: List[Dict[str, np.ndarray]]
+    actions: List[np.ndarray]
+    rewards: List[np.ndarray]
+    dones: List[np.ndarray]
+    log_probs: List[np.ndarray]
+    values: List[np.ndarray]
 
 
 class CNNPolicy(nn.Module):
@@ -159,23 +159,29 @@ class PPOAgent:
             'reward': [],
         }
 
-    def select_action(self, observation: Dict[str, np.ndarray], training: bool = True) -> Tuple[int, float, float]:
+    def select_action(self, observation: Dict[str, np.ndarray], training: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        选择动作
+        选择动作 (支持批量)
 
         Args:
-            observation: 观察 {'image': ..., 'state': ...}
+            observation: 观察 {'image': (N, H, W, C), 'state': (N, D)}
             training: 是否在训练模式
 
         Returns:
-            action: 选择的动作
-            log_prob: 动作的对数概率
-            value: 状态价值
+            action: 选择的动作 (N,)
+            log_prob: 动作的对数概率 (N,)
+            value: 状态价值 (N,)
         """
         with torch.no_grad():
             # 转换观察为 tensor
-            image = torch.FloatTensor(observation['image']).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            state = torch.FloatTensor(observation['state']).unsqueeze(0).to(self.device)
+            # image: (N, H, W, C) -> (N, C, H, W)
+            image = torch.FloatTensor(observation['image']).permute(0, 3, 1, 2).to(self.device)
+            state = torch.FloatTensor(observation['state']).to(self.device)
+
+            # 如果输入是单个样本 (H, W, C)，增加 batch 维度
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+                state = state.unsqueeze(0)
 
             # 获取策略分布
             logits, value = self.policy(image, state)
@@ -187,9 +193,9 @@ class PPOAgent:
                 log_prob = dist.log_prob(action)
             else:
                 action = probs.argmax(dim=-1)
-                log_prob = torch.log(probs.gather(-1, action.unsqueeze(-1)) + 1e-8)
+                log_prob = torch.log(probs.gather(-1, action.unsqueeze(-1)) + 1e-8).squeeze(-1)
 
-            return action.item(), log_prob.item(), value.item()
+            return action.cpu().numpy(), log_prob.cpu().numpy(), value.squeeze(-1).cpu().numpy()
 
     def store_transition(self, obs, action, reward, done, log_prob, value):
         """存储 transition"""
@@ -201,20 +207,27 @@ class PPOAgent:
         self.buffer.values.append(value)
 
     def compute_returns(self):
-        """计算 returns 和 advantages"""
+        """计算 returns 和 advantages (支持批量)"""
         rewards = self.buffer.rewards
         dones = self.buffer.dones
         values = self.buffer.values
 
+        # 获取环境数量 (假设所有 step 的 batch size 一致)
+        n_envs = len(rewards[0]) if isinstance(rewards[0], np.ndarray) else 1
+
         returns = []
-        discounted_reward = 0
+        discounted_reward = np.zeros(n_envs)
         advantages = []
 
         for reward, done, value in zip(reversed(rewards), reversed(dones), reversed(values)):
-            if done:
-                discounted_reward = 0
+            # 如果 done 为 True (1)，则重置 discounted_reward
+            # R_t = r_t + gamma * R_{t+1} * (1 - d_t)
 
-            discounted_reward = reward + self.gamma * discounted_reward
+            # 确保 done 是 numpy array
+            if not isinstance(done, np.ndarray):
+                done = np.array([done])
+
+            discounted_reward = reward + self.gamma * discounted_reward * (1 - done)
             advantage = discounted_reward - value
 
             returns.insert(0, discounted_reward)
@@ -230,14 +243,22 @@ class PPOAgent:
         # 计算 returns 和 advantages
         returns, advantages = self.compute_returns()
 
-        # 转换为 tensor
-        images = torch.FloatTensor([o['image'].transpose(2, 0, 1) for o in self.buffer.observations]).to(self.device)
-        states = torch.FloatTensor([o['state'] for o in self.buffer.observations]).to(self.device)
-        actions = torch.LongTensor(self.buffer.actions).to(self.device)
-        old_log_probs = torch.FloatTensor(self.buffer.log_probs).to(self.device)
-        old_values = torch.FloatTensor(self.buffer.values).to(self.device)
-        returns = torch.FloatTensor(returns).to(self.device)
-        advantages = torch.FloatTensor(advantages).to(self.device)
+        # 展平数据 (N_steps, N_envs, ...) -> (N_steps * N_envs, ...)
+
+        # Observations
+        # obs['image']: list of (N_envs, H, W, C) -> (N_steps * N_envs, C, H, W)
+        obs_images = np.concatenate([o['image'] for o in self.buffer.observations])
+        obs_states = np.concatenate([o['state'] for o in self.buffer.observations])
+
+        images = torch.FloatTensor(obs_images).permute(0, 3, 1, 2).to(self.device)
+        states = torch.FloatTensor(obs_states).to(self.device)
+
+        # Actions, LogProbs, Values, Returns, Advantages
+        actions = torch.LongTensor(np.concatenate(self.buffer.actions)).to(self.device)
+        old_log_probs = torch.FloatTensor(np.concatenate(self.buffer.log_probs)).to(self.device)
+        old_values = torch.FloatTensor(np.concatenate(self.buffer.values)).to(self.device)
+        returns = torch.FloatTensor(np.concatenate(returns)).to(self.device)
+        advantages = torch.FloatTensor(np.concatenate(advantages)).to(self.device)
 
         # 归一化 advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -313,6 +334,11 @@ class RandomAgent:
         self.n_actions = n_actions
 
     def select_action(self, observation, training=False):
+        # Handle batch
+        if isinstance(observation['image'], np.ndarray) and observation['image'].ndim == 4:
+            batch_size = observation['image'].shape[0]
+            return np.random.randint(0, self.n_actions, size=batch_size), np.zeros(batch_size), np.zeros(batch_size)
+
         action = random.randint(0, self.n_actions - 1)
         return action, 0.0, 0.0
 
@@ -388,6 +414,7 @@ class DQNAgent:
         self.replay_buffer = ReplayBuffer(buffer_size)
 
     def select_action(self, observation, training=True):
+        # TODO: Support batch for DQN
         if training and random.random() < self.epsilon:
             return random.randint(0, self.n_actions - 1), 0.0, 0.0
 

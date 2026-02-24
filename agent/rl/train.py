@@ -17,8 +17,8 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+from rich.table import Table
 
 # Redirect C-level stdout/stderr to /dev/null to silence mgba logs
 # while keeping Python's sys.stdout/sys.stderr pointing to the original streams
@@ -55,10 +55,10 @@ os.chdir(project_root)
 from agent.rl.agent import PPOAgent, DQNAgent, RandomAgent
 from agent.rl.reward_function import (
     REWARD_CONFIGS,
-    CustomRewardFunction,
-    ScreenStaticPenalty
+    CustomRewardFunction
 )
 from agent.environment.pokemon_env import PokemonEnv
+from agent.rl.vec_env import SubprocVecEnv
 
 
 def parse_args():
@@ -71,6 +71,8 @@ def parse_args():
                         help='Number of frames to skip per action')
     parser.add_argument('--image-size', type=int, nargs=2, default=[84, 84],
                         help='Image size for state representation')
+    parser.add_argument('--num-envs', type=int, default=1,
+                        help='Number of parallel environments')
 
     # 训练参数
     parser.add_argument('--algorithm', type=str, default='ppo',
@@ -120,6 +122,9 @@ def parse_args():
     parser.add_argument('--device', type=str, default=default_device,
                         help='Device (cuda/mps/cpu)')
 
+    parser.add_argument('--render', action='store_true',
+                        help='Render game screen during training')
+
     return parser.parse_args()
 
 
@@ -151,8 +156,32 @@ def make_layout() -> Layout:
     return layout
 
 
+def make_env(rom_path, frame_skip, image_size, reward_fn=None):
+    """创建环境的辅助函数"""
+    def _init():
+        env = PokemonEnv(
+            rom_path=rom_path,
+            frame_skip=frame_skip,
+            image_size=image_size,
+        )
+        if reward_fn:
+            env.set_reward_function(reward_fn)
+        return env
+    return _init
+
+
+def log_debug(msg):
+    with open("debug_render.log", "a") as f:
+        f.write(f"[{datetime.now()}] {msg}\n")
+
 def train():
     args = parse_args()
+    # Clear debug log
+    with open("debug_render.log", "w") as f:
+        f.write("Starting training...\n")
+
+    log_debug(f"Args: {args}")
+
     console = Console()
 
     # 设置随机种子
@@ -162,25 +191,38 @@ def train():
     # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 创建环境
-    console.print(f"[bold green]Creating environment with ROM: {args.rom}[/bold green]")
-    env = PokemonEnv(
-        rom_path=args.rom,
-        frame_skip=args.frame_skip,
-        image_size=tuple(args.image_size),
-    )
-
-    # 设置奖励函数
+    # 加载奖励函数
     console.print(f"[bold blue]Using reward config: {args.reward_config}[/bold blue]")
     if args.custom_reward:
         reward_fn = load_custom_reward_function(args.custom_reward)
     else:
         reward_fn = REWARD_CONFIGS[args.reward_config]()
-    env.set_reward_function(reward_fn)
+
+    # 创建环境
+    console.print(f"[bold green]Creating {args.num_envs} environment(s) with ROM: {args.rom}[/bold green]")
+
+    if args.num_envs > 1:
+        env_fns = [
+            make_env(args.rom, args.frame_skip, tuple(args.image_size), reward_fn)
+            for _ in range(args.num_envs)
+        ]
+        env = SubprocVecEnv(env_fns)
+        # 获取 action space (假设所有环境一致)
+        # 我们需要临时创建一个环境来获取 action space
+        temp_env = PokemonEnv(rom_path=args.rom)
+        n_actions = temp_env.action_space.n
+        temp_env.close()
+    else:
+        env = PokemonEnv(
+            rom_path=args.rom,
+            frame_skip=args.frame_skip,
+            image_size=tuple(args.image_size),
+        )
+        env.set_reward_function(reward_fn)
+        n_actions = env.action_space.n
 
     # 创建 agent
     console.print(f"[bold magenta]Creating {args.algorithm.upper()} agent[/bold magenta]")
-    n_actions = env.action_space.n
 
     if args.algorithm == 'ppo':
         agent = PPOAgent(
@@ -211,10 +253,80 @@ def train():
         console.print(f"[yellow]Resuming from {args.resume}[/yellow]")
         agent.load(args.resume)
 
+        # 尝试加载奖励函数状态
+        # 假设 resume 路径是 checkpoints/checkpoint_X.pt
+        # 奖励状态路径应该是 checkpoints/checkpoint_X_reward.json
+        reward_state_path = args.resume.replace('.pt', '_reward.json')
+        if os.path.exists(reward_state_path):
+            console.print(f"[yellow]Loading reward state from {reward_state_path}[/yellow]")
+            with open(reward_state_path, 'r') as f:
+                reward_states = json.load(f)
+
+            if args.num_envs > 1:
+                if isinstance(reward_states, list) and len(reward_states) == args.num_envs:
+                    env.set_reward_state(reward_states)
+                else:
+                    console.print("[red]Warning: Reward state mismatch with num_envs, skipping load[/red]")
+            else:
+                env.set_reward_state(reward_states)
+        else:
+            console.print("[yellow]No reward state file found, starting with fresh reward state[/yellow]")
+
+    # 初始化 Pygame (如果需要渲染)
+    screen = None
+    log_debug(f"Render arg: {args.render}")
+    if args.render:
+        try:
+            # Force driver for macOS
+            if sys.platform == 'darwin':
+                os.environ['SDL_VIDEODRIVER'] = 'cocoa'
+
+            import pygame
+            pygame.init()
+            log_debug("Pygame initialized")
+
+            # Create window
+            screen = pygame.display.set_mode((240 * 2, 160 * 2))  # 2x scale
+            pygame.display.set_caption("Pokemon RL Training")
+
+            log_debug(f"Screen created: {screen}")
+
+        except Exception as e:
+            log_debug(f"Pygame init failed: {e}")
+            console.print(f"[red]Pygame init failed: {e}[/red]")
+
     # 训练循环
     state = env.reset()
-    episode_reward = 0
-    episode_steps = 0
+    log_debug("Env reset done")
+
+    # 初始渲染
+    if args.render and screen:
+        try:
+            import pygame
+            # 如果是 VecEnv，state['image'] 是 (N, H, W, C)，取第一个
+            if args.num_envs > 1:
+                # VecEnv 的 state 已经是 dict of arrays
+                # 我们需要从 info 中获取 screenshot，但 reset 只返回 state
+                # 所以这里暂时用 state['image'] 或者跳过
+                pass
+            else:
+                img = env.current_state.get('screenshot')
+                if img:
+                    mode = img.mode
+                    size = img.size
+                    data = img.tobytes()
+                    py_image = pygame.image.fromstring(data, size, mode)
+                    py_image = pygame.transform.scale(py_image, (240 * 2, 160 * 2))
+                    screen.blit(py_image, (0, 0))
+                    pygame.display.flip()
+            log_debug("Initial render done")
+        except Exception as e:
+            log_debug(f"Initial render failed: {e}")
+
+    # 统计变量
+    current_episode_rewards = np.zeros(args.num_envs)
+    current_episode_steps = np.zeros(args.num_envs)
+
     episode_count = 0
     recent_rewards = deque(maxlen=100)
     log_messages = deque(maxlen=10)
@@ -229,7 +341,7 @@ def train():
     header_table.add_column(justify="center", ratio=1)
     header_table.add_column(justify="right")
     header_table.add_row(
-        f"[b]Pokemon RL Training[/b] - {args.algorithm.upper()} - {args.reward_config}",
+        f"[b]Pokemon RL Training[/b] - {args.algorithm.upper()} - {args.reward_config} - {args.num_envs} Envs",
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
     layout["header"].update(Panel(header_table, style="white on blue"))
@@ -246,21 +358,121 @@ def train():
 
     with Live(layout, refresh_per_second=4, screen=True):
         while total_steps < args.total_steps:
+            # 处理 Pygame 事件
+            if args.render:
+                import pygame
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        env.close()
+                        return
+
             # 选择动作
             action, log_prob, value = agent.select_action(state, training=True)
 
             # 执行动作
             next_state, reward, done, info = env.step(action)
 
+            # 更新统计
+            # reward 和 done 都是数组 (N,)
+            if args.num_envs == 1:
+                # 单环境兼容
+                reward = np.array([reward])
+                done = np.array([done])
+                info = [info] # Make it a list
+                # action, log_prob, value 已经是 scalar 或 array，取决于 select_action
+                # 如果是单环境，select_action 返回的是 scalar，需要转为 array 以便统一处理
+                if not isinstance(action, np.ndarray):
+                    action = np.array([action])
+                    log_prob = np.array([log_prob])
+                    value = np.array([value])
+
+            current_episode_rewards += reward
+            current_episode_steps += 1
+
+            # 检查完成的 episode
+            for i in range(args.num_envs):
+                if done[i]:
+                    recent_rewards.append(current_episode_rewards[i])
+                    log_episode_rewards.append(current_episode_rewards[i])
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Env {i} finished. Reward: {current_episode_rewards[i]:.2f}")
+
+                    current_episode_rewards[i] = 0
+                    current_episode_steps[i] = 0
+                    episode_count += 1
+
+            # 渲染画面 (显示所有环境的网格)
+            if args.render and screen:
+                try:
+                    import pygame
+
+                    # 获取所有环境的图像
+                    images = []
+                    if args.num_envs > 1:
+                        for i in range(args.num_envs):
+                            img = info[i].get('screenshot')
+                            if img:
+                                images.append(img)
+                    else:
+                        img = info[0].get('screenshot')
+                        if img:
+                            images.append(img)
+
+                    if images:
+                        # 计算网格布局
+                        n_envs = len(images)
+                        cols = int(np.ceil(np.sqrt(n_envs)))
+                        rows = int(np.ceil(n_envs / cols))
+
+                        # 单个图像大小 (2x scale)
+                        w, h = 240 * 2, 160 * 2
+
+                        # 调整屏幕大小 (如果需要)
+                        target_w = w * cols
+                        target_h = h * rows
+                        if screen.get_width() != target_w or screen.get_height() != target_h:
+                            screen = pygame.display.set_mode((target_w, target_h))
+                            log_debug(f"Resized screen to {target_w}x{target_h}")
+
+                        # 绘制每个环境
+                        for i, img in enumerate(images):
+                            # Convert PIL image to surface
+                            mode = img.mode
+                            size = img.size
+                            data = img.tobytes()
+                            py_image = pygame.image.fromstring(data, size, mode)
+                            # Scale up
+                            py_image = pygame.transform.scale(py_image, (w, h))
+
+                            # 计算位置
+                            r = i // cols
+                            c = i % cols
+                            screen.blit(py_image, (c * w, r * h))
+
+                        pygame.display.flip()
+                    else:
+                        if total_steps % 100 == 0:
+                            log_messages.append(f"Warning: Screenshot is None at step {total_steps}")
+                            log_debug(f"No screenshots at step {total_steps}")
+
+                    # 保持窗口响应
+                    pygame.event.pump()
+
+                except Exception as e:
+                    log_messages.append(f"Render Error: {str(e)}")
+                    log_debug(f"Render loop error: {e}")
+
             # 存储 transition
             if args.algorithm == 'ppo':
                 agent.store_transition(state, action, reward, done, log_prob, value)
             elif args.algorithm == 'dqn':
-                agent.store_transition(state, action, reward, next_state, done)
+                # DQN 需要修改以支持 batch，暂时只支持单环境或需要修改 store_transition
+                if args.num_envs == 1:
+                    agent.store_transition(state, action[0], reward[0], next_state, done[0])
+                else:
+                    # TODO: Support batch DQN
+                    pass
 
-            # 更新统计
-            episode_reward += reward
-            episode_steps += 1
+            state = next_state
             total_steps += 1
             job_progress.update(task_id, advance=1)
 
@@ -278,9 +490,8 @@ def train():
                 left_table = Table(expand=True)
                 left_table.add_column("Metric", style="cyan")
                 left_table.add_column("Value", style="magenta")
-                left_table.add_row("Episode", str(episode_count))
-                left_table.add_row("Steps", str(episode_steps))
-                left_table.add_row("Current Reward", f"{episode_reward:.2f}")
+                left_table.add_row("Episodes", str(episode_count))
+                left_table.add_row("Avg Reward (100)", f"{avg_reward:.2f}")
 
                 if args.algorithm == 'dqn':
                     left_table.add_row("Epsilon", f"{getattr(agent, 'epsilon', 'N/A'):.4f}")
@@ -292,20 +503,36 @@ def train():
 
                 layout["left"].update(Panel(left_table, title="Training Status", border_style="green"))
 
-                # Center Panel: Game State
+                # Center Panel: Game State (Best Env)
                 center_table = Table(expand=True)
                 center_table.add_column("State", style="cyan")
                 center_table.add_column("Info", style="white")
 
+                # Find best env (highest total party level)
+                best_env_idx = 0
+                max_total_level = -1
+
+                # Ensure info is a list
+                info_list = info if isinstance(info, (list, tuple)) else [info]
+
+                for i, env_info in enumerate(info_list):
+                    party = env_info.get('party', [])
+                    total_level = sum(mon.get('level', 0) for mon in party)
+                    if total_level > max_total_level:
+                        max_total_level = total_level
+                        best_env_idx = i
+
+                best_info = info_list[best_env_idx]
+
                 # Location
-                loc = info.get('location', {})
+                loc = best_info.get('location', {})
                 map_name = loc.get('map_name', 'Unknown')
                 map_id = f"({loc.get('map_group', 0)}, {loc.get('map_num', 0)})"
                 coords = f"({loc.get('x', 0)}, {loc.get('y', 0)})"
                 center_table.add_row("Location", f"{map_name}\n{map_id} {coords}")
 
                 # Party
-                party = info.get('party', [])
+                party = best_info.get('party', [])
                 party_info = []
                 for mon in party:
                     name = mon.get('species', 'Unknown')
@@ -319,7 +546,7 @@ def train():
                     center_table.add_row("Party", "\n".join(party_info))
 
                 # Bag (Summary)
-                bag = info.get('bag', {})
+                bag = best_info.get('bag', {})
                 bag_summary = []
                 for pocket, items in bag.items():
                     count = len(items)
@@ -329,7 +556,7 @@ def train():
                 if bag_summary:
                     center_table.add_row("Bag", ", ".join(bag_summary))
 
-                layout["center"].update(Panel(center_table, title="Game State", border_style="yellow"))
+                layout["center"].update(Panel(center_table, title=f"Game State (Env {best_env_idx} - Best)", border_style="yellow"))
 
                 # Right Panel: Statistics
                 right_table = Table(expand=True)
@@ -351,18 +578,23 @@ def train():
             if total_steps % args.save_freq == 0:
                 save_path = os.path.join(args.save_dir, f'checkpoint_{total_steps}.pt')
                 agent.save(save_path)
+
+                # 保存奖励函数状态
+                reward_state_path = os.path.join(args.save_dir, f'checkpoint_{total_steps}_reward.json')
+                if args.num_envs > 1:
+                    # 对于多环境，我们保存所有环境的奖励状态列表
+                    reward_states = env.get_reward_state()
+                    # Convert sets to lists for JSON serialization
+                    # Note: This assumes reward state is JSON serializable or we need to handle it
+                    # Our current implementation returns dicts with lists, so it should be fine
+                    with open(reward_state_path, 'w') as f:
+                        json.dump(reward_states, f)
+                else:
+                    reward_state = env.get_reward_state()
+                    with open(reward_state_path, 'w') as f:
+                        json.dump(reward_state, f)
+
                 log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Saved checkpoint to {save_path}")
-
-            # 重置 episode
-            if done:
-                recent_rewards.append(episode_reward)
-                log_episode_rewards.append(episode_reward)
-                log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Episode {episode_count} finished. Reward: {episode_reward:.2f}")
-
-                state = env.reset()
-                episode_reward = 0
-                episode_steps = 0
-                episode_count += 1
 
     # 保存最终模型
     final_path = os.path.join(args.save_dir, 'final_model.pt')
@@ -436,7 +668,12 @@ def evaluate():
         max_steps = 10000
 
         while steps < max_steps:
+            # 评估模式下，select_action 返回 scalar
             action, _, _ = agent.select_action(state, training=False)
+            # 如果 select_action 返回的是 array (因为我们修改了它)，取第一个
+            if isinstance(action, np.ndarray):
+                action = action[0]
+
             state, reward, done, info = env.step(action)
             episode_reward += reward
             steps += 1

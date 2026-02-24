@@ -4,7 +4,7 @@ Reward Function Module for Pokemon RL Agent
 这个模块封装了各种奖励函数，你可以根据需要自定义和组合。
 """
 
-from typing import Dict, List, Callable
+from typing import Dict, List, Callable, Any
 
 import numpy as np
 
@@ -29,6 +29,18 @@ class RewardFunction:
         """
         raise NotImplementedError
 
+    def state_dict(self) -> Dict[str, Any]:
+        """返回状态字典"""
+        return {}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """加载状态字典"""
+        pass
+
+    def reset(self):
+        """重置奖励函数状态 (在 episode 开始时调用)"""
+        pass
+
 
 class CombinedReward(RewardFunction):
     """组合多个奖励函数"""
@@ -42,6 +54,22 @@ class CombinedReward(RewardFunction):
         for reward_fn, weight in self.rewards.items():
             total += weight * reward_fn.compute(prev_state, current_state, action)
         return total
+
+    def state_dict(self) -> Dict[str, Any]:
+        state = {}
+        for i, (reward_fn, _) in enumerate(self.rewards.items()):
+            state[f"{reward_fn.name}_{i}"] = reward_fn.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        for i, (reward_fn, _) in enumerate(self.rewards.items()):
+            key = f"{reward_fn.name}_{i}"
+            if key in state_dict:
+                reward_fn.load_state_dict(state_dict[key])
+
+    def reset(self):
+        for reward_fn in self.rewards.keys():
+            reward_fn.reset()
 
 
 class HPChangeReward(RewardFunction):
@@ -144,6 +172,22 @@ class ExplorationReward(RewardFunction):
     def _get_coord_key(self, state: Dict) -> tuple:
         loc = state.get("location", {})
         return (loc.get("map_group", 0), loc.get("map_num", 0), loc.get("x", 0), loc.get("y", 0))
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "visited_maps": list(self.visited_maps),
+            "visited_coords": list(self.visited_coords),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        if "visited_maps" in state_dict:
+            self.visited_maps = set(tuple(x) if isinstance(x, list) else x for x in state_dict["visited_maps"])
+        if "visited_coords" in state_dict:
+            self.visited_coords = set(tuple(x) if isinstance(x, list) else x for x in state_dict["visited_coords"])
+
+    def reset(self):
+        self.visited_maps.clear()
+        self.visited_coords.clear()
 
 
 class ItemReward(RewardFunction):
@@ -323,6 +367,21 @@ class GameStartReward(RewardFunction):
 
         return reward
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {"milestones": self.milestones}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        if "milestones" in state_dict:
+            self.milestones = state_dict["milestones"]
+
+    def reset(self):
+        self.milestones = {
+            "in_game": False,
+            "littleroot": False,
+            "route101": False,
+            "has_pokemon": False,
+        }
+
 
 class CustomRewardFunction:
     """
@@ -414,6 +473,7 @@ REWARD_CONFIGS = {
         ImageChangeReward(change_weight=0.1, threshold=10000): 1.0,
         GameStartReward(milestone_reward=20.0): 1.0,
         StepPenalty(penalty=-0.001): 1.0,
+        ExplorationReward(location_weight=5.0, coord_weight=0.1): 1.0,
     }),
 }
 
