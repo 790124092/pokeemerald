@@ -470,10 +470,9 @@ REWARD_CONFIGS = {
     }),
     "start_game": lambda: CombinedReward({
         ScreenStaticPenalty(penalty=-0.1, threshold=10000): 1.0,
-        ImageChangeReward(change_weight=0.1, threshold=10000): 1.0,
         GameStartReward(milestone_reward=20.0): 1.0,
         StepPenalty(penalty=-0.001): 1.0,
-        ExplorationReward(location_weight=5.0, coord_weight=0.1): 1.0,
+        ExplorationReward(location_weight=10.0, coord_weight=0.5): 1.0,
     }),
 }
 

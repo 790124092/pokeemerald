@@ -103,6 +103,8 @@ def parse_args():
                         help='Discount factor')
     parser.add_argument('--eps-clip', type=float, default=0.2,
                         help='PPO clip range')
+    parser.add_argument('--ent-coef', type=float, default=0.05,
+                        help='Entropy coefficient for PPO')
 
     # 其他
     parser.add_argument('--seed', type=int, default=42,
@@ -170,18 +172,8 @@ def make_env(rom_path, frame_skip, image_size, reward_fn=None):
     return _init
 
 
-def log_debug(msg):
-    with open("debug_render.log", "a") as f:
-        f.write(f"[{datetime.now()}] {msg}\n")
-
 def train():
     args = parse_args()
-    # Clear debug log
-    with open("debug_render.log", "w") as f:
-        f.write("Starting training...\n")
-
-    log_debug(f"Args: {args}")
-
     console = Console()
 
     # 设置随机种子
@@ -232,6 +224,7 @@ def train():
             lr=args.lr,
             gamma=args.gamma,
             eps_clip=args.eps_clip,
+            ent_coef=args.ent_coef,
             device=args.device,
         )
     elif args.algorithm == 'dqn':
@@ -274,7 +267,6 @@ def train():
 
     # 初始化 Pygame (如果需要渲染)
     screen = None
-    log_debug(f"Render arg: {args.render}")
     if args.render:
         try:
             # Force driver for macOS
@@ -283,21 +275,16 @@ def train():
 
             import pygame
             pygame.init()
-            log_debug("Pygame initialized")
 
             # Create window
             screen = pygame.display.set_mode((240 * 2, 160 * 2))  # 2x scale
             pygame.display.set_caption("Pokemon RL Training")
 
-            log_debug(f"Screen created: {screen}")
-
         except Exception as e:
-            log_debug(f"Pygame init failed: {e}")
             console.print(f"[red]Pygame init failed: {e}[/red]")
 
     # 训练循环
     state = env.reset()
-    log_debug("Env reset done")
 
     # 初始渲染
     if args.render and screen:
@@ -319,9 +306,8 @@ def train():
                     py_image = pygame.transform.scale(py_image, (240 * 2, 160 * 2))
                     screen.blit(py_image, (0, 0))
                     pygame.display.flip()
-            log_debug("Initial render done")
         except Exception as e:
-            log_debug(f"Initial render failed: {e}")
+            pass
 
     # 统计变量
     current_episode_rewards = np.zeros(args.num_envs)
@@ -423,43 +409,65 @@ def train():
                         cols = int(np.ceil(np.sqrt(n_envs)))
                         rows = int(np.ceil(n_envs / cols))
 
-                        # 单个图像大小 (2x scale)
-                        w, h = 240 * 2, 160 * 2
+                        # 单个图像原始大小 (2x scale)
+                        single_w, single_h = 240 * 2, 160 * 2
+
+                        # 完整拼接图的大小
+                        full_w = single_w * cols
+                        full_h = single_h * rows
+
+                        # 屏幕最大尺寸限制 (适应 Mac 屏幕)
+                        MAX_WIDTH = 1400
+                        MAX_HEIGHT = 900
+
+                        # 计算缩放比例
+                        scale = 1.0
+                        if full_w > MAX_WIDTH or full_h > MAX_HEIGHT:
+                            scale = min(MAX_WIDTH / full_w, MAX_HEIGHT / full_h)
+
+                        final_w = int(full_w * scale)
+                        final_h = int(full_h * scale)
 
                         # 调整屏幕大小 (如果需要)
-                        target_w = w * cols
-                        target_h = h * rows
-                        if screen.get_width() != target_w or screen.get_height() != target_h:
-                            screen = pygame.display.set_mode((target_w, target_h))
-                            log_debug(f"Resized screen to {target_w}x{target_h}")
+                        if screen.get_width() != final_w or screen.get_height() != final_h:
+                            screen = pygame.display.set_mode((final_w, final_h))
 
-                        # 绘制每个环境
+                        # 创建一个大画布用于拼接
+                        full_surface = pygame.Surface((full_w, full_h))
+
+                        # 绘制每个环境到大画布
                         for i, img in enumerate(images):
                             # Convert PIL image to surface
                             mode = img.mode
                             size = img.size
                             data = img.tobytes()
                             py_image = pygame.image.fromstring(data, size, mode)
-                            # Scale up
-                            py_image = pygame.transform.scale(py_image, (w, h))
+                            # Scale up to single cell size
+                            py_image = pygame.transform.scale(py_image, (single_w, single_h))
 
                             # 计算位置
                             r = i // cols
                             c = i % cols
-                            screen.blit(py_image, (c * w, r * h))
+                            full_surface.blit(py_image, (c * single_w, r * single_h))
+
+                        # 缩放并显示到屏幕
+                        if scale != 1.0:
+                            # 使用 smoothscale 获得更好的缩放质量
+                            final_surface = pygame.transform.smoothscale(full_surface, (final_w, final_h))
+                            screen.blit(final_surface, (0, 0))
+                        else:
+                            screen.blit(full_surface, (0, 0))
 
                         pygame.display.flip()
                     else:
                         if total_steps % 100 == 0:
                             log_messages.append(f"Warning: Screenshot is None at step {total_steps}")
-                            log_debug(f"No screenshots at step {total_steps}")
 
                     # 保持窗口响应
                     pygame.event.pump()
 
                 except Exception as e:
                     log_messages.append(f"Render Error: {str(e)}")
-                    log_debug(f"Render loop error: {e}")
 
             # 存储 transition
             if args.algorithm == 'ppo':
@@ -479,7 +487,14 @@ def train():
             # 更新策略
             if total_steps % args.update_freq == 0:
                 if args.algorithm == 'ppo':
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Updating policy...")
+                    # Force a UI refresh before the blocking update
+                    layout["footer"].update(Panel("\n".join(log_messages), title="Logs", border_style="white"))
+                    # We can't easily force a Rich Live refresh here without access to the Live object directly
+                    # But updating the layout object should be reflected on next refresh
+
                     agent.update()
+                    log_messages.append(f"[{datetime.now().strftime('%H:%M:%S')}] Policy updated.")
 
             # 更新界面
             if total_steps % args.log_freq == 0:
